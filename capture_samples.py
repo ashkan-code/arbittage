@@ -22,11 +22,7 @@ PAUSE = 0.35          # seconds between calls, to stay polite on rate limits
 DEPTH_RUNS = 20
 
 # Base URLs and paths are best guesses; every attempt is recorded either way.
-BASES = [
-    "https://api.bitunix.com",
-    "https://openapi.bitunix.com",
-    "https://spot.bitunix.com",
-]
+BASES = ["https://openapi.bitunix.com"]   # api. gives 403, spot. does not resolve
 PAIR_PATHS = [
     "/api/spot/v1/market/trading_pair/list",
     "/api/spot/v1/market/trading_pairs",
@@ -43,6 +39,13 @@ DEPTH_QUERIES = [          # {sym} is filled in; precision/limit are guesses
 ]
 PRICE_PATHS = ["/api/spot/v1/market/last_price"]
 PRICE_QUERIES = ["symbol={sym}"]
+TICKER_PATHS = [                      # looking for ONE call that returns all pairs
+    "/api/spot/v1/market/ticker",
+    "/api/spot/v1/market/tickers",
+    "/api/spot/v1/market/ticker/list",
+    "/api/spot/v1/market/book_ticker",
+    "/api/spot/v1/market/24h_ticker",
+]
 ALT_CANDIDATES = ["DOGEUSDT", "ADAUSDT", "XRPUSDT", "TRXUSDT"]
 
 attempts = []   # everything we try, in order
@@ -133,6 +136,59 @@ def find_alt_symbol(pair_body):
     return syms[-1] if syms else None
 
 
+def pct(sorted_vals, p):
+    return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * p))]
+
+
+def stats(vals):
+    s = sorted(vals)
+    if not s:
+        return None
+    return {"n": len(s), "median_ms": round(statistics.median(s), 1),
+            "p90_ms": pct(s, 0.9), "min_ms": s[0], "max_ms": s[-1]}
+
+
+def connection_test(url):
+    """First call on a new connection (DNS+TCP+TLS handshake) vs 20 calls that
+    reuse the same open connection. Stdlib http.client keeps the socket open."""
+    import http.client
+    import urllib.parse
+    u = urllib.parse.urlsplit(url)
+    path = u.path + ("?" + u.query if u.query else "")
+    out = {"url": url, "first_call_ms": None, "reused_ms": [], "fresh_each_time_ms": [], "errors": []}
+    print("\nKeep-alive test")
+    try:
+        c = http.client.HTTPSConnection(u.netloc, timeout=TIMEOUT)
+        for i in range(DEPTH_RUNS + 1):
+            t0 = time.perf_counter()
+            c.request("GET", path, headers={"User-Agent": "capture-samples/1.0",
+                                            "Connection": "keep-alive"})
+            r = c.getresponse()
+            r.read()
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            if r.status != 200:
+                out["errors"].append(f"call {i}: HTTP {r.status}")
+            elif i == 0:
+                out["first_call_ms"] = ms
+            else:
+                out["reused_ms"].append(ms)
+            time.sleep(PAUSE)
+        c.close()
+    except Exception as e:
+        out["errors"].append(f"{type(e).__name__}: {e}")
+    for _ in range(5):                       # a few brand-new connections for comparison
+        res = get(url)
+        if res["status"] == 200:
+            out["fresh_each_time_ms"].append(res["elapsed_ms"])
+        time.sleep(PAUSE)
+    out["reused_stats"] = stats(out["reused_ms"])
+    out["fresh_stats"] = stats(out["fresh_each_time_ms"])
+    print(f"  first call (handshake): {out['first_call_ms']} ms")
+    print(f"  next {DEPTH_RUNS} reused:        {out['reused_stats']}")
+    print(f"  5 fresh connections:    {out['fresh_stats']}")
+    return out
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     started = time.strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -170,6 +226,14 @@ def main():
         w = first_ok(f"last_price_{sym}", urls)
         keep_copy(w, f"last_price_{sym}.json")
 
+    # 3b) Bulk ticker / best bid-ask for all pairs: try with and without a symbol
+    for p in TICKER_PATHS:
+        for q in ["", "?symbol=BTCUSDT"]:
+            res = get(base + p + q)
+            e = record("ticker", res)
+            if res["status"] == 200:
+                keep_copy((None, res, e), "ticker_" + safe(p.split("/market/")[1] + q) + ".json")
+
     # 4) Latency: 20 sequential depth calls on the URL that worked
     latency = {"url": None, "runs": DEPTH_RUNS, "samples_ms": [], "failures": 0}
     w = depth_winner.get("BTCUSDT")
@@ -194,6 +258,11 @@ def main():
     else:
         print("\nSkipping latency test: no depth URL returned 200.")
 
+    # 4b) Fresh connection each time vs one reused (keep-alive) connection
+    keepalive = None
+    if w:
+        keepalive = connection_test(w[0])
+
     # 5) One report with everything. Raw bodies are also inlined (truncated)
     #    so you can paste or send just this single file.
     inline = {}
@@ -212,6 +281,7 @@ def main():
         "altcoin_symbol": alt,
         "attempts": attempts,
         "latency_depth_btcusdt": latency,
+        "keepalive_test": keepalive,
         "raw_bodies_inline": inline,
     }
     path = os.path.join(OUT, "capture_report.json")
